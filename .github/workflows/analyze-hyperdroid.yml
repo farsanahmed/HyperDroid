@@ -1,0 +1,199 @@
+name: Analyze HyperDroid XAPK
+
+on:
+  workflow_dispatch:
+    inputs:
+      xapk_path:
+        description: "Workspace-relative path to the supplied XAPK"
+        required: false
+        default: ".harness/attachments/1030-003115-74ac7f01-HyperDroid_-_PC_Launcher_2.7_APKPure.xapk"
+      use_remote_xapk:
+        description: "Download the XAPK from the protected URL in repository secret HYPERDROID_XAPK_URL"
+        required: false
+        default: "true"
+        type: boolean
+      remote_xapk_destination:
+        description: "Destination path for a remotely downloaded XAPK"
+        required: false
+        default: ".harness/attachments/HyperDroid-private.xapk"
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Retrieve XAPK securely (optional)
+        if: ${{ inputs.use_remote_xapk }}
+        env:
+          XAPK_URL: ${{ secrets.HYPERDROID_XAPK_URL }}
+          XAPK_TOKEN: ${{ secrets.HYPERDROID_XAPK_TOKEN }}
+          XAPK_DEST: ${{ inputs.remote_xapk_destination }}
+        run: |
+          set -euo pipefail
+          test -n "$XAPK_URL" || { echo "::error::HYPERDROID_XAPK_URL secret is not configured."; exit 1; }
+          mkdir -p "$(dirname "$XAPK_DEST")"
+          if [ -n "$XAPK_TOKEN" ]; then
+            curl -fsSL -L \
+              -H "Authorization: Bearer ${XAPK_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              "$XAPK_URL" -o "$XAPK_DEST"
+          else
+            curl -fsSL -L \
+              -H "Accept: application/octet-stream" \
+              "$XAPK_URL" -o "$XAPK_DEST"
+          fi
+          echo "Downloaded XAPK to $XAPK_DEST"
+      - name: Verify supplied XAPK is present
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.use_remote_xapk }}" = "true" ]; then
+            XAPK="${{ inputs.remote_xapk_destination }}"
+          else
+            XAPK="${{ inputs.xapk_path }}"
+          fi
+          if [ ! -f "$XAPK" ]; then
+            echo "::error::Supplied XAPK not found at '$XAPK'."
+            echo "Provide the XAPK securely as a workflow artifact/input or repository-local file that is not committed."
+            echo "Do not commit the XAPK, extracted APKs, decompiled source, signing keys, or credentials."
+            exit 1
+          fi
+          test "$(stat -c %s "$XAPK")" -gt 0 || { echo "::error::XAPK is empty."; exit 1; }
+          unzip -t "$XAPK" >/dev/null
+          unzip -l "$XAPK" | grep -Eq '\.apk$' || { echo "::error::XAPK does not contain an APK."; exit 1; }
+          file "$XAPK"
+          sha256sum "$XAPK"
+
+      - name: Install APKTool
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/tools/apktool"
+          curl -fsSL -o "$HOME/tools/apktool/apktool.jar" \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          cat > "$HOME/tools/apktool/apktool" <<'EOF'
+          #!/usr/bin/env bash
+          exec java -jar "$HOME/tools/apktool/apktool.jar" "$@"
+          EOF
+          chmod +x "$HOME/tools/apktool/apktool"
+          echo "$HOME/tools/apktool" >> "$GITHUB_PATH"
+          apktool --version
+
+      - name: Install JADX
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/tools/jadx"
+          curl -fsSL -o /tmp/jadx.zip \
+            https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
+          unzip -q /tmp/jadx.zip -d "$HOME/tools/jadx"
+          chmod +x "$HOME/tools/jadx/bin/jadx" "$HOME/tools/jadx/bin/jadx-gui" 2>/dev/null || true
+          echo "$HOME/tools/jadx/bin" >> "$GITHUB_PATH"
+          jadx --version
+
+      - name: Inspect XAPK archive
+        run: |
+          set -euo pipefail
+          XAPK="${{ github.event.inputs.xapk_path }}"
+          mkdir -p work/xapk-extract
+          unzip -l "$XAPK" | tee reports/archive-listing.txt
+          unzip -q "$XAPK" -d work/xapk-extract
+          find work/xapk-extract -maxdepth 2 -type f -printf '%p\n' | sort
+
+      - name: Run offline reverse-engineering analysis
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          XAPK="${{ github.event.inputs.xapk_path }}"
+          BASE_APK="$(find work/xapk-extract -maxdepth 2 -type f -name '*.apk' | sort | head -n 1)"
+          echo "Base APK: $BASE_APK" | tee reports/analysis-log.txt
+          echo "APKTool: $(apktool --version)" | tee -a reports/analysis-log.txt
+          echo "JADX: $(jadx --version)" | tee -a reports/analysis-log.txt
+
+          set +e
+          apktool d -f -o work/apktool-out "$BASE_APK" >> reports/analysis-log.txt 2>&1
+          APKTOOL_RC=$?
+          jadx -d work/jadx-out "$BASE_APK" >> reports/analysis-log.txt 2>&1
+          JADX_RC=$?
+          set -e
+
+          {
+            echo "# HyperDroid analysis log"
+            echo
+            echo "- XAPK: $XAPK"
+            echo "- Base APK: $BASE_APK"
+            echo "- APKTool version: $(apktool --version)"
+            echo "- JADX version: $(jadx --version)"
+            echo "- apktool exit code: $APKTOOL_RC"
+            echo "- jadx exit code: $JADX_RC"
+            echo
+            echo "## REA MCP"
+            echo "REA MCP is not assumed to be available in GitHub Actions. This workflow uses offline APKTool/JADX analysis only. Do not claim REA was used unless a reachable REA MCP server is explicitly configured and invoked."
+          } > reports/analysis-summary.md
+
+          test "$APKTOOL_RC" -eq 0 || echo "APKTool failed; see reports/analysis-log.txt" >&2
+          test "$JADX_RC" -eq 0 || echo "JADX failed; see reports/analysis-log.txt" >&2
+
+      - name: Generate report skeletons
+        run: |
+          set -euo pipefail
+          cat > HYPERDROID_SPEC.md <<'EOF'
+          # HyperDroid Technical Specification
+
+          Generated by `.github/workflows/analyze-hyperdroid.yml`.
+
+          ## Scope
+
+          This specification must be populated from verified APKTool/JADX output and XAPK metadata. No proprietary decompiled source or assets are committed.
+
+          ## Verified inputs
+
+          - Supplied XAPK path from workflow input
+          - Extracted APK inventory from `reports/archive-listing.txt`
+          - APKTool and JADX output under `work/` (not committed)
+
+          ## Status
+
+          Analysis output is available in the restricted workflow artifact. Review `reports/analysis-log.txt` and `reports/analysis-summary.md` before finalizing findings.
+          EOF
+
+          cat > FEATURE_INVENTORY.md <<'EOF'
+          # Feature Inventory
+
+          Populate from verified manifest components, resources, strings, and decompiled behavior. Each feature must cite evidence from the analysis artifact.
+          EOF
+
+          cat > COMPONENT_MAP.md <<'EOF'
+          # Component Map
+
+          Populate from AndroidManifest.xml and decompiled code. Include activities, services, receivers, providers, permissions, and intent filters.
+          EOF
+
+          cat > UNRESOLVED_QUESTIONS.md <<'EOF'
+          # Unresolved Questions
+
+          - REA MCP availability in GitHub Actions is not assumed.
+          - Original XAPK and decompiled contents are not committed.
+          - Final findings require review of generated analysis artifacts.
+          EOF
+
+      - name: Upload restricted analysis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperdroid-analysis
+          path: |
+            reports/
+            HYPERDROID_SPEC.md
+            FEATURE_INVENTORY.md
+            COMPONENT_MAP.md
+            UNRESOLVED_QUESTIONS.md
+          retention-days: 14
+          if-no-files-found: error
