@@ -19,8 +19,9 @@ jobs:
           java-version: "17"
       - name: Setup Android SDK
         run: |
-          yes | sdkmanager --licenses
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
       - name: Build
         run: ./gradlew assembleDebug 2>&1 || true
